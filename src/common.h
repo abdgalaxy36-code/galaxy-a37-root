@@ -28,6 +28,8 @@
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -380,6 +382,8 @@ void open_selected_fds(
     fd_set *in, fd_set *out, fd_set *ex, int read_fd, int write_fd);
 void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex);
 void do_pselect_fake_lock_route(void);
+void do_tcp_fake_lock_route(void);
+int tcp_route_selected(void);
 
 int slide_leak_kernel_base(void);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
