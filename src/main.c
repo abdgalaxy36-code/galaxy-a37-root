@@ -7,6 +7,7 @@ atomic_int waiter_ready;
 atomic_int waiter_waiting;
 atomic_int owner_started;
 atomic_int owner_chain_done;
+atomic_int owner_stop;
 atomic_int route_done;
 atomic_int waiter_tid;
 atomic_int punch_consume_go;
@@ -138,6 +139,7 @@ void reset_main_route_state(void) {
   atomic_store(&waiter_waiting, 0);
   atomic_store(&owner_started, 0);
   atomic_store(&owner_chain_done, 0);
+  atomic_store(&owner_stop, 0);
   atomic_store(&route_done, 0);
   atomic_store(&waiter_tid, 0);
   atomic_store(&punch_consume_go, 0);
