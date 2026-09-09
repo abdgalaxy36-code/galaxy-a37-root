@@ -20,7 +20,6 @@ APP_PRELOAD := $(OUTDIR)/cve-2026-43499-app.so
 APP_RELEASE := $(OUTDIR)/cve-2026-43499-app.release.so
 APP_RELEASE_SIZE := 104128
 ROOT_HELPER := $(OUTDIR)/cve-2026-43499-root
-V2ROOT_BIN := $(OUTDIR)/v2root
 
 PRELOAD_SRCS := \
   src/main.c \
@@ -47,13 +46,11 @@ COMMON_CFLAGS := \
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean info release v2root
+.PHONY: all clean info release
 
-all: v2root $(PRELOAD) $(APP_PRELOAD) $(ROOT_HELPER)
+all: $(PRELOAD) $(APP_PRELOAD) $(ROOT_HELPER)
 
 release: $(APP_RELEASE)
-
-v2root: $(V2ROOT_BIN)
 
 $(OUTDIR):
 	mkdir -p $@
@@ -80,9 +77,6 @@ $(APP_RELEASE): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h s
 	@test $$(stat -c %s $@) -le $(APP_RELEASE_SIZE)
 	truncate -s $(APP_RELEASE_SIZE) $@
 
-$(V2ROOT_BIN): v2root/v2root_loader.c | $(OUTDIR)
-	$(TARGET_CC) -fPIE -pie -O2 -g0 -Wall -Wextra $< -o $@
-
 info:
 	@echo "TARGET=$(TARGET)"
 	@echo "TARGET_CC=$(TARGET_CC)"
@@ -90,7 +84,6 @@ info:
 	@echo "APP_PRELOAD=$(APP_PRELOAD)"
 	@echo "APP_RELEASE=$(APP_RELEASE)"
 	@echo "ROOT_HELPER=$(ROOT_HELPER)"
-	@echo "V2ROOT_BIN=$(V2ROOT_BIN)"
 
 clean:
 	rm -rf $(OUTDIR)
