@@ -899,11 +899,7 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
     __asm__ volatile("yield" ::: "memory");
   }
 
-#if defined(TARGET_USES_TCP_ZEROCOPY) && TARGET_USES_TCP_ZEROCOPY
-  slide_tcp_stack_copy();
-#else
   slide_pselect_stack_copy();
-#endif
   atomic_store(&slide_route_done, 1);
 
   for (;;) {
