@@ -426,9 +426,13 @@ fail:
 }
 
 int tcp_route_selected(void) {
+#ifdef TARGET_USES_TCP_ZEROCOPY
+  return 1;
+#else
   const char *env = getenv("CVE43499_TCP_ROUTE");
   if (env && *env && strcmp(env, "0") != 0) return 1;
   return 0;
+#endif
 }
 
 #define TCP_PUNCH_SHMEM_LEN (16 * 1024 * 1024)
